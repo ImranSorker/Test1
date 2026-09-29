@@ -32,7 +32,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -50,6 +50,9 @@ from sandbox_service.exceptions import (
 from sandbox_service.models import ExecutionRequest, ExecutionResult, HealthReport
 from sandbox_service.observability import get_logger
 from sandbox_service.service import SandboxService, build_backend
+
+if TYPE_CHECKING:  # keep core app free of runtime test-utility imports
+    from sandbox_service.testing import ResultHandler
 
 
 class RequestMetrics:
@@ -158,6 +161,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     service: SandboxService | None = None,
+    fake_handler: ResultHandler | None = None,
 ) -> FastAPI:
     """Build the FastAPI application (dependency-injectable factory).
 
@@ -168,6 +172,10 @@ def create_app(
         service: Pre-built service (used by tests to inject fakes). When
             omitted, one is constructed in the app lifespan from
             :func:`~sandbox_service.service.build_backend`.
+        fake_handler: Sync or async ``spec -> ExecutionResult`` callable
+            forwarded to :func:`build_backend` when the configured backend
+            is ``fake`` — lets harnesses emulate execution semantics without
+            spawning processes. Ignored otherwise.
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance. Its lifespan owns
@@ -198,7 +206,8 @@ def create_app(
         """
         own_service = service is None
         active = service or SandboxService(
-            resolved_settings, backend=build_backend(resolved_settings)
+            resolved_settings,
+            backend=build_backend(resolved_settings, fake_handler=fake_handler),
         )
         app.state.service = active
         app.state.settings = resolved_settings

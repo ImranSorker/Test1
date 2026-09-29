@@ -11,48 +11,13 @@ from fastapi.testclient import TestClient
 
 from sandbox_service.api import RequestMetrics, ResultCache, create_app
 from sandbox_service.config import Settings
-from sandbox_service.exceptions import SandboxError, ServiceBusyError
+from sandbox_service.exceptions import ServiceBusyError
 from sandbox_service.interfaces import ExecutionSpec
 from sandbox_service.models import ExecutionRequest, ExecutionResult, ExecutionStatus
 from sandbox_service.service import SandboxService
 from sandbox_service.testing import FakeBackend
 
-
-class EchoBackend(FakeBackend):
-    """Fake backend that *evaluates* Python print-literals like a real kernel.
-
-    Keeps HTTP tests honest: the service pipeline (workspace, safety, limits)
-    runs for real and stdout reflects execution, not source echo.
-    """
-
-    async def run(self, spec: ExecutionSpec) -> ExecutionResult:
-        """Return a deterministic result derived from the submitted source.
-
-        Args:
-            spec: Resolved execution description.
-
-        Returns:
-            Successful result whose stdout mirrors what CPython would print
-            for ``print(<literal>)`` sources; falls back to echoing the raw
-            source for anything else.
-        """
-        self.calls.append(spec)
-        source = spec.source.strip()
-        stdout = source
-        if source.startswith("print(") and source.endswith(")"):
-            inner = source[len("print(") : -1].strip("'\"")
-            try:
-                stdout = str(eval(inner, {"__builtins__": {}}, {}))  # noqa: S307 - test-only literal eval
-            except SyntaxError:
-                stdout = inner
-        return ExecutionResult(
-            execution_id=spec.execution_id,
-            status=ExecutionStatus.SUCCEEDED,
-            exit_code=0,
-            stdout=f"{stdout}\n",
-            backend=self.name,
-            created_at=self._clock.now(),
-        )
+from conftest import _echo_print_handler
 
 
 def _payload(source: str = "print('hi')", **extra: object) -> dict[str, object]:
@@ -61,16 +26,10 @@ def _payload(source: str = "print('hi')", **extra: object) -> dict[str, object]:
     return body
 
 
-def _echo_client(tmp_path: Path) -> TestClient:
-    """TestClient wired to an EchoBackend through the default lifespan path."""
-    settings = Settings(default_backend="fake", workspace_root=tmp_path / "ws")
-    return TestClient(create_app(settings))
-
-
 def _authed_client(tmp_path: Path, token: str) -> TestClient:
     """TestClient with bearer auth configured and a fake backend injected."""
     settings = Settings(default_backend="fake", workspace_root=tmp_path / "ws", api_auth_token=token)
-    svc = SandboxService(settings, backend=FakeBackend())
+    svc = SandboxService(settings, backend=FakeBackend(handler=_echo_print_handler))
     return TestClient(create_app(settings, service=svc))
 
 

@@ -1,1 +1,6 @@
+# Compiled and build artifacts
 __pycache__/
+*.pyc
+
+# Coverage reports
+.coverage

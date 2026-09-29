@@ -21,13 +21,20 @@ Example:
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Self
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import Self, Union
 
 from sandbox_service.exceptions import BackendUnavailableError
 from sandbox_service.interfaces import Clock, ExecutionSpec
 from sandbox_service.models import ExecutionResult, ExecutionStatus
 from sandbox_service.observability import SystemClock, get_logger
+
+ResultHandler = Union[
+    Callable[[ExecutionSpec], ExecutionResult],
+    Callable[[ExecutionSpec], Awaitable[ExecutionResult]],
+]
+"""Sync or async spec-to-result callable consumed by :class:`FakeBackend`."""
 
 
 class FakeBackend:
@@ -37,8 +44,9 @@ class FakeBackend:
 
     * ``records``: scripted results popped one per :meth:`run`; the last
       record repeats forever once the list is exhausted.
-    * ``handler``: optional ``spec -> ExecutionResult`` callable, consulted
-      before ``records`` — use it to assert on specs or echo inputs.
+    * ``handler``: optional ``spec -> ExecutionResult`` callable (sync or
+      async), consulted before ``records`` — use it to assert on specs or
+      emulate execution without spawning processes.
     * ``raise_on_run``: exception instance raised by every :meth:`run`
       (e.g. ``BackendUnavailableError("boom")``) to exercise failure paths.
     * ``healthy``: fixed answer returned by :meth:`health_check`.
@@ -53,7 +61,7 @@ class FakeBackend:
         self,
         *,
         records: list[ExecutionResult] | None = None,
-        handler: Callable[[ExecutionSpec], ExecutionResult] | None = None,
+        handler: ResultHandler | None = None,
         raise_on_run: BaseException | None = None,
         healthy: bool = True,
         clock: Clock | None = None,
@@ -62,8 +70,8 @@ class FakeBackend:
 
         Args:
             records: Scripted results consumed in order (last one repeats).
-            handler: Synchronous spec-to-result mapping with precedence over
-                ``records``.
+            handler: Sync or async spec-to-result mapping with precedence
+                over ``records``.
             raise_on_run: If set, :meth:`run` raises this exception after
                 recording the spec (failure-path injection).
             healthy: Value returned by :meth:`health_check`.
@@ -116,7 +124,8 @@ class FakeBackend:
         if self._raise_on_run is not None:
             raise self._raise_on_run
         if self._handler is not None:
-            base = self._handler(spec)
+            produced = self._handler(spec)
+            base = await produced if inspect.isawaitable(produced) else produced
         else:
             record = self._next_record()
             base = record if record is not None else ExecutionResult(

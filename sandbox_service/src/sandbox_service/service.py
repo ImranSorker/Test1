@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -54,6 +54,9 @@ from sandbox_service.models import (
 from sandbox_service.observability import SystemClock, get_logger
 from sandbox_service.safety import SafetyChecker
 
+if TYPE_CHECKING:  # avoid runtime import of test utilities from core logic
+    from sandbox_service.testing import ResultHandler
+
 
 def _dedupe_findings(findings: list[SafetyFinding]) -> list[SafetyFinding]:
     """De-duplicate safety findings while preserving first-seen order.
@@ -81,6 +84,7 @@ def build_backend(
     settings: Settings,
     *,
     fake_records: list[ExecutionResult] | None = None,
+    fake_handler: ResultHandler | None = None,
 ) -> ExecutionBackend:
     """Factory mapping ``settings.default_backend`` to a concrete adapter.
 
@@ -89,6 +93,10 @@ def build_backend(
         fake_records: Scripted results for the ``fake`` backend (ignored by
             other backends); each :meth:`run` call pops one, and the last
             record repeats once the list is exhausted.
+        fake_handler: Sync or async ``spec -> ExecutionResult`` callable for
+            the ``fake`` backend, consulted before ``fake_records`` — lets
+            harnesses emulate execution semantics (e.g. echo/print) without
+            spawning processes.
 
     Returns:
         A fresh backend instance satisfying :class:`ExecutionBackend`.
@@ -114,7 +122,7 @@ def build_backend(
     if name == "fake":
         from sandbox_service.testing import FakeBackend
 
-        return FakeBackend(records=list(fake_records or []))
+        return FakeBackend(records=fake_records, handler=fake_handler)
     raise BackendUnavailableError(f"unknown backend {name!r} requested by configuration")
 
 

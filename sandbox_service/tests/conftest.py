@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from sandbox_service.api import create_app
 from sandbox_service.config import Settings
-from sandbox_service.interfaces import Clock
+from sandbox_service.interfaces import Clock, ExecutionSpec
 from sandbox_service.models import ExecutionResult, ExecutionStatus
 from sandbox_service.service import SandboxService
 from sandbox_service.testing import FakeBackend
@@ -79,7 +80,46 @@ def fake_clock() -> FakeClock:
 
 @pytest.fixture
 def fake_backend() -> FakeBackend:
+    """Plain echo fake backend (raw source on stdout)."""
     return FakeBackend()
+
+
+def _echo_print_handler(spec: ExecutionSpec) -> ExecutionResult:
+    """Emulate CPython ``print(<expr>)`` for constant expressions safely.
+
+    Uses :func:`ast.parse` + :func:`ast.literal_eval` on the folded tree
+    (never ``eval``/``compile``), so only literal and constant-foldable
+    arithmetic arguments are interpreted; anything else echoes the source.
+
+    Args:
+        spec: Resolved execution description.
+
+    Returns:
+        Successful result whose stdout mirrors what CPython would print for
+        constant-expression ``print(...)`` sources; echoes the source
+        otherwise.
+    """
+    source = spec.source.strip()
+    stdout = source
+    if source.startswith("print(") and source.endswith(")"):
+        inner = source[len("print(") : -1].strip()
+        try:
+            stdout = str(ast.literal_eval(ast.parse(inner, mode="eval", feature_version=(3, 12))))
+        except (ValueError, SyntaxError):
+            stdout = inner.strip("'\"")
+    return ExecutionResult(
+        execution_id=spec.execution_id,
+        status=ExecutionStatus.SUCCEEDED,
+        exit_code=0,
+        stdout=f"{stdout}\n",
+        backend="fake",
+    )
+
+
+@pytest.fixture
+def printing_backend() -> FakeBackend:
+    """Fake backend that "executes" ``print(<literal>)`` like a real kernel."""
+    return FakeBackend(handler=_echo_print_handler)
 
 
 @pytest.fixture
@@ -94,9 +134,11 @@ def succeeded_result() -> ExecutionResult:
 
 
 @pytest.fixture
-def client(tmp_settings: Settings, fake_backend: FakeBackend, fake_clock: FakeClock) -> Iterator[TestClient]:
+def client(
+    tmp_settings: Settings, printing_backend: FakeBackend, fake_clock: FakeClock
+) -> Iterator[TestClient]:
     """TestClient wired to an injected service; lifespan runs via context mgr."""
-    svc = SandboxService(tmp_settings, backend=fake_backend, clock=fake_clock)
+    svc = SandboxService(tmp_settings, backend=printing_backend, clock=fake_clock)
     app = create_app(tmp_settings, service=svc)
     with TestClient(app) as test_client:
         yield test_client

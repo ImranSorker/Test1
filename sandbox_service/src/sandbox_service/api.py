@@ -2,17 +2,21 @@
 
 Endpoints (all JSON):
 
-* ``GET  /healthz``          — liveness + backend/circuit status
-* ``POST /v1/executions``    — run a submission, return :class:`ExecutionResult`
-* ``GET  /v1/languages``     — configured language allowlist
-* ``GET  /metrics``          — lightweight request counters (JSON)
+* ``GET  /healthz``           — liveness + backend/circuit status (public)
+* ``POST /v1/executions``     — run a submission, return :class:`ExecutionResult`
+* ``GET  /v1/executions/{id}``— fetch a completed result from the LRU cache
+* ``GET  /v1/languages``      — configured language allowlist
+* ``GET  /metrics``           — lightweight request counters (JSON)
 
 The application service is created inside the app's lifespan and exposed via
 ``app.state``; tests build the app with an injected service through
 :func:`create_app` — no global state, no module-level singletons.
 
 Auth: when ``Settings.api_auth_token`` is set, every route except ``/healthz``
-requires ``Authorization: Bearer <token>``.
+requires ``Authorization: Bearer <token>``. The check runs as an HTTP
+middleware so it cannot be bypassed by dependency-resolution ordering quirks
+(see the ``require_token`` incident this replaces: a stale closure made *every*
+request fail with 422 regardless of credentials).
 
 Example:
     >>> from fastapi.testclient import TestClient
@@ -23,13 +27,14 @@ Example:
 from __future__ import annotations
 
 import json
+import secrets
 import threading
-from contextlib import asynccontextmanager
+from collections import OrderedDict
 from collections.abc import AsyncIterator
-from typing import Annotated, Any
+from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import ValidationError
 
 from sandbox_service.config import Settings
@@ -91,6 +96,62 @@ class RequestMetrics:
             }
 
 
+class ResultCache:
+    """Bounded, thread-safe LRU cache of recent :class:`ExecutionResult`s.
+
+    Enables ``GET /v1/executions/{id}`` lookups without any database — a
+    deliberate local-first trade-off documented in the README. Eviction is
+    least-recently-*inserted* first once ``max_items`` is exceeded.
+
+    Attributes:
+        max_items: Maximum number of results retained.
+    """
+
+    def __init__(self, max_items: int = 256) -> None:
+        """Initialize an empty cache.
+
+        Args:
+            max_items: Positive retention bound.
+
+        Raises:
+            ValueError: If ``max_items`` < 1.
+        """
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        self.max_items: int = max_items
+        self._lock = threading.Lock()
+        self._items: OrderedDict[str, ExecutionResult] = OrderedDict()
+
+    def put(self, result: ExecutionResult) -> None:
+        """Store one result keyed by its execution id (evicting oldest).
+
+        Args:
+            result: The completed execution to retain.
+        """
+        with self._lock:
+            self._items[result.execution_id] = result
+            while len(self._items) > self.max_items:
+                self._items.popitem(last=False)
+
+    def get(self, execution_id: str) -> ExecutionResult | None:
+        """Fetch a cached result by id.
+
+        Args:
+            execution_id: Server-assigned job id.
+
+        Returns:
+            The stored :class:`ExecutionResult`, or ``None`` when unknown or
+            already evicted.
+        """
+        with self._lock:
+            return self._items.get(execution_id)
+
+    def __len__(self) -> int:
+        """Number of results currently retained."""
+        with self._lock:
+            return len(self._items)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -115,12 +176,13 @@ def create_app(
         >>> from sandbox_service.service import SandboxService
         >>> svc = SandboxService(backend=FakeBackend())
         >>> app = create_app(service=svc)
-        >>> [route.path for route in app.routes if hasattr(route, "path")][:4]
-        ['/openapi.json', '/docs', '/docs/oauth2-redirect', '/redoc']
+        >>> [route.path for route in app.routes if getattr(route, "path", "") == "/v1/executions"]
+        ['/v1/executions']
     """
     resolved_settings = settings or (service.settings if service else Settings())
     log = get_logger(__name__, component="http_api")
     metrics = RequestMetrics()
+    result_cache = ResultCache(max_items=resolved_settings.result_cache_size)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -139,6 +201,7 @@ def create_app(
         app.state.service = active
         app.state.settings = resolved_settings
         app.state.metrics = metrics
+        app.state.result_cache = result_cache
         log.info("api_startup", backend=active.backend_name)
         try:
             yield
@@ -153,35 +216,43 @@ def create_app(
         description="Local-first sandboxed code execution for agent stacks.",
         lifespan=lifespan,
     )
-    # auto_error=False is essential: unauthenticated requests must reach our
-    # logic (which no-ops when auth is disabled) instead of a generic 403.
-    bearer = HTTPBearer(auto_error=False)
 
-    async def require_token(
-        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
-    ) -> None:
-        """Reject requests lacking the configured bearer token.
+    # Public paths that never require credentials even when auth is configured.
+    public_paths = frozenset({"/healthz", "/docs", "/redoc", "/openapi.json"})
+
+    @app.middleware("http")
+    async def authenticate(request: Request, call_next: Any) -> Response:
+        """Enforce bearer-token auth on every non-public route.
+
+        Implemented as middleware (not a route dependency) so authentication
+        cannot be skipped or shadowed by request-body validation ordering.
 
         Args:
-            credentials: Parsed Authorization header, if present.
+            request: In-flight HTTP request.
+            call_next: Downstream app callable.
 
-        Raises:
-            HTTPException: 401 when auth is configured and the token is
-                missing or wrong.
+        Returns:
+            Whatever the downstream produces, or a 401 JSON response when
+            credentials are missing/invalid and auth is configured.
         """
         expected = resolved_settings.api_auth_token
-        if not expected:
-            return
-        if credentials is None or credentials.scheme.lower() != "bearer":
-            raise HTTPException(
+        path = request.url.path.rstrip("/") or "/"
+        if not expected or path in public_paths:
+            return await call_next(request)
+        header = request.headers.get("authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(
+            token.encode("utf-8"), expected.encode("utf-8")
+        ):
+            return Response(
+                content=_json_dumps(
+                    {"error": "unauthorized", "message": "valid bearer token required"}
+                ),
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"error": "unauthorized", "message": "bearer token required"},
+                media_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"},
             )
-        if credentials.credentials != expected:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"error": "unauthorized", "message": "invalid token"},
-            )
+        return await call_next(request)
 
     @app.exception_handler(SandboxError)
     async def sandbox_error_handler(request: Request, exc: SandboxError) -> Response:
@@ -244,17 +315,23 @@ def create_app(
     @app.post(
         "/v1/executions",
         response_model=ExecutionResult,
-        dependencies=[Depends(require_token)],
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            401: {"description": "Missing or invalid bearer token (auth configured)."},
+            422: {"description": "Request failed validation or safety policy."},
+            503: {"description": "Circuit open; retry later."},
+        },
     )
-    async def create_execution(payload: dict[str, Any]) -> ExecutionResult:
+    async def create_execution(request: ExecutionRequest) -> ExecutionResult:
         """Run one submission end-to-end.
 
         Args:
-            payload: JSON body matching
-                :class:`~sandbox_service.models.ExecutionRequest`.
+            request: Validated :class:`ExecutionRequest` parsed from the JSON
+                body by FastAPI (schemas stay in OpenAPI automatically).
 
         Returns:
-            The typed execution result (captured stdout/stderr/status).
+            The typed execution result (captured stdout/stderr/status), also
+            retained in the in-memory result cache for retrieval by id.
 
         Raises:
             HTTPException: 422 with a structured body when the payload fails
@@ -263,8 +340,8 @@ def create_app(
         """
         svc: SandboxService = app.state.service
         try:
-            request = ExecutionRequest.model_validate(payload)
-        except ValidationError as exc:
+            result = await svc.execute(request)
+        except ValidationError as exc:  # defensive: pydantic errors escaping service
             metrics.record_rejection(ValidationError_.code)
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -274,9 +351,31 @@ def create_app(
                     "details": {"errors": _safe_errors(exc)},
                 },
             ) from exc
-        result = await svc.execute(request)
         metrics.record_execution(result.status.value)
+        result_cache.put(result)
         return result
+
+    @app.get("/v1/executions/{execution_id}", response_model=ExecutionResult)
+    async def get_execution(execution_id: str) -> ExecutionResult:
+        """Fetch a completed result from the bounded in-memory cache.
+
+        Args:
+            execution_id: Server-assigned id returned by ``POST /v1/executions``.
+
+        Returns:
+            The cached :class:`ExecutionResult`.
+
+        Raises:
+            HTTPException: 404 when the id is unknown or was evicted (the
+                cache is best-effort; there is no persistent store by design).
+        """
+        cached = result_cache.get(execution_id)
+        if cached is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "not_found", "message": f"unknown execution {execution_id!r}"},
+            )
+        return cached
 
     return app
 

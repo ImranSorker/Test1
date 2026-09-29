@@ -53,6 +53,28 @@ from sandbox_service.observability import SystemClock, get_logger
 from sandbox_service.safety import SafetyChecker
 
 
+def _dedupe_findings(findings: list[SafetyFinding]) -> list[SafetyFinding]:
+    """De-duplicate safety findings while preserving first-seen order.
+
+    ``SafetyFinding`` is a frozen pydantic model but lists are unhashable, so
+    hashing the whole model is unsafe; key on its serialized form instead.
+
+    Args:
+        findings: Raw findings from multiple sources (checker + backend).
+
+    Returns:
+        A new list with exact duplicates removed.
+    """
+    seen: set[str] = set()
+    out: list[SafetyFinding] = []
+    for finding in findings:
+        key = finding.model_dump_json()
+        if key not in seen:
+            seen.add(key)
+            out.append(finding)
+    return out
+
+
 def build_backend(
     settings: Settings,
     *,
@@ -221,7 +243,7 @@ class SandboxService:
         updated = result.model_copy(
             update={
                 "created_at": self._clock.now(),
-                "findings": list(dict.fromkeys(findings + list(result.findings))),
+                "findings": _dedupe_findings([*findings, *result.findings]),
             }
         )
         log.info("execute_finished", status=updated.status.value, duration_ms=updated.duration_ms)

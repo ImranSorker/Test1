@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     allowed_languages: list[str] = ["python", "bash"]
     enforce_safety_by_default: bool = False
 
+    # --- http api server ---------------------------------------------------
+    result_cache_size: int = Field(default=256, ge=1, le=100_000)
+
     # --- local adapter -----------------------------------------------------
     python_binary: str = ""
     bash_binary: str = ""
@@ -148,8 +151,6 @@ class Settings(BaseSettings):
             raise ValueError("SANDBOX_RETRY_BASE_DELAY_S must be <= SANDBOX_RETRY_MAX_DELAY_S")
         if self.default_backend == "http" and not self.remote_base_url:
             raise ValueError("SANDBOX_REMOTE_BASE_URL is required when backend is 'http'")
-        if self.max_timeout_s < self.default_timeout_s:
-            raise ValueError("SANDBOX_MAX_TIMEOUT_S must be >= SANDBOX_DEFAULT_TIMEOUT_S")
         return self
 
     @property

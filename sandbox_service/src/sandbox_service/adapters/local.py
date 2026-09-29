@@ -24,6 +24,7 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Self
 
 from sandbox_service.config import Settings
 from sandbox_service.exceptions import BackendUnavailableError
@@ -207,6 +208,29 @@ class LocalProcessBackend:
     async def close(self) -> None:
         """No persistent handles to release; present for port conformance."""
         return None
+
+    async def __aenter__(self) -> Self:
+        """Enter the async context manager.
+
+        Returns:
+            ``self``.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
+        """Exit the async context manager, releasing the (empty) kernel state.
+
+        Args:
+            exc_type: In-flight exception type, if any.
+            exc: In-flight exception, if any.
+            tb: Traceback object, if any.
+        """
+        await self.close()
 
     def _interpreter_for(self, language: Language) -> str:
         """Map a language to its interpreter binary path.

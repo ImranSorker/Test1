@@ -19,6 +19,7 @@ Example:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -35,6 +36,7 @@ from sandbox_service.exceptions import (
     CircuitOpenError,
     LanguageNotSupportedError,
     SandboxError,
+    ServiceBusyError,
     UnsafeCodeError,
     ValidationError_,
     WorkspaceError,
@@ -154,6 +156,10 @@ class SandboxService:
         self._safety: SafetyChecker = safety or SafetyChecker()
         self._clock: Clock = clock or SystemClock()
         self.backend_name: str = self._backend.name
+        # Back-pressure: cap simultaneous in-flight executions so a burst of
+        # agent requests cannot fork-bomb the host. Fail-fast (no queueing):
+        # callers get ServiceBusyError + Retry-After and can back off.
+        self._semaphore = asyncio.Semaphore(self.settings.max_concurrent_executions)
         self._closed = False
         self._log = get_logger(__name__, component="service", backend=self.backend_name)
 
@@ -180,11 +186,35 @@ class SandboxService:
             WorkspaceError: Workspace creation/file injection failed.
             CircuitOpenError: Backend breaker rejects the call outright and no
                 fallback exists.
+            ServiceBusyError: ``settings.max_concurrent_executions`` slots are
+                all in flight; retry after the advertised backoff.
 
         Note:
             Kernel-level failures (backend down after retries, crashes) are
             *not* raised: they come back as ``status=error`` results with a
             machine-readable ``error`` code.
+        """
+        if self._semaphore.locked():
+            # Fail fast instead of queueing: agents handle 429 + Retry-After
+            # far better than silently piling up latency-sensitive requests.
+            raise ServiceBusyError(
+                "sandbox is at capacity; try again shortly",
+                retry_after_seconds=min(self.settings.default_timeout_s, 5.0),
+            )
+        async with self._semaphore:
+            return await self._execute_locked(request)
+
+    async def _execute_locked(self, request: ExecutionRequest) -> ExecutionResult:
+        """Run one submission while holding a concurrency slot.
+
+        Split out from :meth:`execute` so the semaphore acquisition point stays
+        visible and the pipeline body remains readable.
+
+        Args:
+            request: Validated client submission.
+
+        Returns:
+            :class:`ExecutionResult` with captured output and status.
         """
         execution_id = new_execution_id()
         log = self._log.bind(execution_id=execution_id, language=request.language.value)
@@ -370,7 +400,7 @@ class SandboxService:
         if request.language.value not in self.settings.allowed_languages:
             raise LanguageNotSupportedError(
                 f"language {request.language.value!r} is not enabled",
-                allowed=list(self.settings.allowed_languages),
+                details={"allowed": sorted(self.settings.allowed_languages)},
             )
         report = self._safety.inspect(request.language, request.source)
         if report.findings:

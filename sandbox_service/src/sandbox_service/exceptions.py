@@ -103,6 +103,42 @@ class CircuitOpenError(SandboxError):
         self.details["retry_after_seconds"] = retry_after_seconds
 
 
+class ServiceBusyError(SandboxError):
+    """Raised when the concurrency limit is reached and no slot is available.
+
+    Back-pressure signal for agent orchestration: callers should retry after
+    ``retry_after_seconds`` (surfaced as an HTTP ``Retry-After`` header).
+
+    Attributes:
+        retry_after_seconds: Conservative estimate of when a slot frees up.
+
+    Example:
+        >>> err = ServiceBusyError("queue full", retry_after_seconds=2.5)
+        >>> err.to_dict()["details"]["retry_after_seconds"]
+        2.5
+    """
+
+    code = "service_busy"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        """Initialize with the estimated wait window.
+
+        Args:
+            message: Human-readable description.
+            retry_after_seconds: Seconds until a slot is likely free.
+            details: Optional structured context.
+        """
+        super().__init__(message, details=details)
+        self.retry_after_seconds: float = retry_after_seconds
+        self.details["retry_after_seconds"] = retry_after_seconds
+
+
 class LanguageNotSupportedError(SandboxError):
     """Raised when a request asks for a language outside the configured allowlist.
 

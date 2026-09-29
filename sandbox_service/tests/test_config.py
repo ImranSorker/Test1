@@ -20,6 +20,8 @@ class TestSettingsDefaults:
     def test_reads_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SANDBOX_DEFAULT_BACKEND", "fake")
         monkeypatch.setenv("SANDBOX_MAX_TIMEOUT_S", "30")
+        # NoDecode keeps pydantic-settings from JSON-parsing list env vars;
+        # the before-validator owns comma-separated splitting/normalizing.
         monkeypatch.setenv("SANDBOX_ALLOWED_LANGUAGES", "Python, bash ")
         s = Settings()
         assert s.default_backend == "fake"

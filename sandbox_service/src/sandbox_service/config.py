@@ -17,10 +17,10 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BackendName = Literal["local", "docker", "http", "fake"]
 
@@ -64,8 +64,11 @@ class Settings(BaseSettings):
     max_processes: int = Field(default=128, ge=1, le=1024)
 
     # --- policy ------------------------------------------------------------
-    allowed_languages: list[str] = ["python", "bash"]
+    allowed_languages: Annotated[list[str], NoDecode] = ["python", "bash"]
     enforce_safety_by_default: bool = False
+
+    # --- concurrency -------------------------------------------------------
+    max_concurrent_executions: int = Field(default=4, ge=1, le=1024)
 
     # --- http api server ---------------------------------------------------
     result_cache_size: int = Field(default=256, ge=1, le=100_000)

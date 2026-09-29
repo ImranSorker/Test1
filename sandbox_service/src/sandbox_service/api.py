@@ -35,6 +35,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from sandbox_service.config import Settings
@@ -42,6 +43,7 @@ from sandbox_service.exceptions import (
     CircuitOpenError,
     LanguageNotSupportedError,
     SandboxError,
+    ServiceBusyError,
     UnsafeCodeError,
     ValidationError_,
 )
@@ -254,6 +256,34 @@ def create_app(
             )
         return await call_next(request)
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_handler(request: Request, exc: RequestValidationError) -> Response:
+        """Return the same structured error shape for body-validation failures.
+
+        FastAPI's default 422 body (``{"detail": [...]}``) differs from the
+        domain-error envelope; unifying both keeps client parsing simple and
+        counts malformed payloads as rejections in ``/metrics``.
+
+        Args:
+            request: In-flight request.
+            exc: The request validation error raised by FastAPI.
+
+        Returns:
+            JSON response with ``error``, ``message`` and ``details`` keys.
+        """
+        metrics.record_rejection(ValidationError_.code)
+        return Response(
+            content=_json_dumps(
+                {
+                    "error": ValidationError_.code,
+                    "message": "request failed validation",
+                    "details": {"errors": _safe_errors(exc)},
+                }
+            ),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            media_type="application/json",
+        )
+
     @app.exception_handler(SandboxError)
     async def sandbox_error_handler(request: Request, exc: SandboxError) -> Response:
         """Map typed domain errors onto stable HTTP codes/JSON bodies.
@@ -272,10 +302,11 @@ def create_app(
             UnsafeCodeError.code: status.HTTP_422_UNPROCESSABLE_ENTITY,
             LanguageNotSupportedError.code: status.HTTP_422_UNPROCESSABLE_ENTITY,
             CircuitOpenError.code: status.HTTP_503_SERVICE_UNAVAILABLE,
+            ServiceBusyError.code: status.HTTP_429_TOO_MANY_REQUESTS,
         }
         http_code = code_map.get(exc.code, status.HTTP_500_INTERNAL_SERVER_ERROR)
         headers: dict[str, str] = {}
-        if isinstance(exc, CircuitOpenError):
+        if isinstance(exc, (CircuitOpenError, ServiceBusyError)):
             headers["Retry-After"] = str(int(exc.retry_after_seconds) + 1)
         return Response(
             content=_json_dumps(exc.to_dict()),
@@ -392,11 +423,11 @@ def _json_dumps(obj: object) -> str:
     return json.dumps(obj, default=str)
 
 
-def _safe_errors(exc: ValidationError) -> list[dict[str, Any]]:
-    """Reduce a pydantic ValidationError to JSON-safe entries.
+def _safe_errors(exc: ValidationError | RequestValidationError) -> list[dict[str, Any]]:
+    """Reduce a validation error to JSON-safe entries.
 
     Args:
-        exc: The validation error to summarize.
+        exc: The pydantic or FastAPI request validation error to summarize.
 
     Returns:
         List of ``{loc, msg, type}`` dicts with non-serializable values

@@ -40,6 +40,8 @@ class ExecutionSpec:
         stdin: Text fed to the process' standard input.
         env: Environment variables for the process (already merged/sanitized).
         cwd: Host directory that the backend should expose as the workdir.
+        entrypoint_name: Workspace-relative filename holding ``source``
+            (written by the service before the backend runs).
         limits: Enforced resource budget.
         extra: Adapter-specific hints (e.g. docker image overrides).
     """
@@ -52,6 +54,7 @@ class ExecutionSpec:
     stdin: str = ""
     env: dict[str, str] = field(default_factory=dict)
     cwd: Path = Path(".")
+    entrypoint_name: str = "__main__.py"
     limits: ResourceLimits = field(default_factory=ResourceLimits)
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -156,6 +159,22 @@ class RandomSource(Protocol):
 @runtime_checkable
 class WorkspaceManager(Protocol):
     """Creates and disposes isolated working directories for jobs."""
+
+    async def write_files(self, workspace: Path, files: list[Any]) -> list[Path]:
+        """Inject client-supplied input files into a workspace asynchronously.
+
+        Args:
+            workspace: Directory previously returned by :meth:`create`.
+            files: Validated :class:`~sandbox_service.models.InputFile` items.
+
+        Returns:
+            Absolute paths of the written files, in input order.
+
+        Raises:
+            WorkspaceError: On unsafe paths (traversal/symlink escape) or I/O
+                failures.
+        """
+        ...
 
     def create(self, execution_id: str) -> Path:
         """Create a fresh workspace directory for one job.

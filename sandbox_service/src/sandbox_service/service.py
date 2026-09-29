@@ -19,8 +19,6 @@ Example:
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -28,9 +26,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from sandbox_service.adapters.docker import DockerBackend
-from sandbox_service.adapters.local import LocalProcessBackend, _entrypoint_filename
+from sandbox_service.adapters.local import LocalProcessBackend
 from sandbox_service.adapters.remote import HttpRemoteBackend
-from sandbox_service.adapters.workspace import LocalWorkspaceManager
+from sandbox_service.adapters.workspace import LocalWorkspaceManager, entrypoint_filename
 from sandbox_service.config import Settings
 from sandbox_service.exceptions import (
     BackendUnavailableError,
@@ -47,7 +45,6 @@ from sandbox_service.models import (
     ExecutionResult,
     ExecutionStatus,
     HealthReport,
-    Language,
     ResourceLimits,
     SafetyFinding,
     new_execution_id,
@@ -56,21 +53,28 @@ from sandbox_service.observability import SystemClock, get_logger
 from sandbox_service.safety import SafetyChecker
 
 
-def build_backend(settings: Settings) -> ExecutionBackend:
+def build_backend(
+    settings: Settings,
+    *,
+    fake_records: list[ExecutionResult] | None = None,
+) -> ExecutionBackend:
     """Factory mapping ``settings.default_backend`` to a concrete adapter.
 
     Args:
         settings: Resolved service settings.
+        fake_records: Scripted results for the ``fake`` backend (ignored by
+            other backends); each :meth:`run` call pops one, and the last
+            record repeats once the list is exhausted.
 
     Returns:
         A fresh backend instance satisfying :class:`ExecutionBackend`.
 
     Raises:
-        BackendUnavailableError: If the selected backend cannot initialize
-            (e.g. docker CLI missing when ``default_backend == "docker"`` is
-            deferred to first use; here only unknown names raise).
-        ConfigurationError: If an http backend is requested without a URL
-            (surfaced as :class:`BackendUnavailableError`).
+        BackendUnavailableError: If the selected backend name is unknown or a
+            required dependency is missing at construction time (e.g. an
+            unconfigured remote URL). Docker/local adapters defer interpreter
+            and daemon checks to first use so importing this factory never
+            requires those tools.
 
     Example:
         >>> build_backend(Settings(default_backend="local")).name
@@ -83,6 +87,10 @@ def build_backend(settings: Settings) -> ExecutionBackend:
         return DockerBackend(settings)
     if name == "http":
         return HttpRemoteBackend(settings)
+    if name == "fake":
+        from sandbox_service.testing import FakeBackend
+
+        return FakeBackend(records=list(fake_records or []))
     raise BackendUnavailableError(f"unknown backend {name!r} requested by configuration")
 
 
@@ -145,40 +153,65 @@ class SandboxService:
         Raises:
             ValidationError_: Request failed domain-model normalization.
             LanguageNotSupportedError: Language outside the allowlist.
-            UnsafeCodeError: Blocking safety findings while ``enforce_safety``.
-            CircuitOpenError: Remote backend breaker is rejecting calls.
+            UnsafeCodeError: Blocking safety findings under enforcement
+                (per-request flag or ``settings.enforce_safety_by_default``).
+            WorkspaceError: Workspace creation/file injection failed.
+            CircuitOpenError: Backend breaker rejects the call outright and no
+                fallback exists.
+
+        Note:
+            Kernel-level failures (backend down after retries, crashes) are
+            *not* raised: they come back as ``status=error`` results with a
+            machine-readable ``error`` code.
         """
         execution_id = new_execution_id()
         log = self._log.bind(execution_id=execution_id, language=request.language.value)
         limits = self._resolve_limits(request.limits)
-        findings = self._check_safety(request, enforce=request.enforce_safety, log=log)
+        enforce = request.enforce_safety or self.settings.enforce_safety_by_default
+        findings = self._check_safety(request, enforce=enforce, log=log)
 
         workspace_path: Path | None = None
+        started = self._clock.monotonic()
         try:
             workspace_path = self._prepare_workspace(execution_id, request)
+            await self._write_input_files(workspace_path, request)
             spec = ExecutionSpec(
                 execution_id=execution_id,
                 language=request.language,
-                command=[],  # kernels derive argv from language + cwd
+                command=[],  # kernels derive argv from language + entrypoint_name
                 source=request.source,
                 args=list(request.args),
                 stdin=request.stdin,
                 env=dict(request.env),
                 cwd=workspace_path,
+                entrypoint_name=entrypoint_filename(request.language),
                 limits=limits,
             )
             result = await self._run_with_fallback(spec, log=log)
-        except CircuitOpenError:
+        except (CircuitOpenError, UnsafeCodeError, LanguageNotSupportedError, ValidationError_):
+            # Request-level policy rejections propagate as typed exceptions;
+            # the HTTP/CLI surfaces translate them into structured responses.
             raise
-        except SandboxError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - boundary: convert to typed error result
+        except SandboxError as exc:
+            # Adapters exhausted their own resilience budget (e.g. remote and
+            # fallback both unavailable): surface as a typed error result.
+            log.error("backend_failed", error=str(exc), code=exc.code)
+            result = ExecutionResult(
+                execution_id=execution_id,
+                status=ExecutionStatus.ERROR,
+                error=exc.code,
+                stderr=str(exc),
+                duration_ms=int((self._clock.monotonic() - started) * 1000),
+                backend=self.backend_name,
+            )
+        except Exception as exc:  # noqa: BLE001 - outermost boundary: never crash the caller
             log.error("execution_crashed", error_type=type(exc).__name__, error=str(exc))
             result = ExecutionResult(
                 execution_id=execution_id,
                 status=ExecutionStatus.ERROR,
                 error=getattr(exc, "code", "internal_error"),
                 stderr=f"{type(exc).__name__}: {exc}",
+                duration_ms=int((self._clock.monotonic() - started) * 1000),
                 backend=self.backend_name,
             )
         finally:
@@ -191,6 +224,7 @@ class SandboxService:
                 "findings": list(dict.fromkeys(findings + list(result.findings))),
             }
         )
+        log.info("execute_finished", status=updated.status.value, duration_ms=updated.duration_ms)
         return updated
 
     async def health(self) -> HealthReport:
@@ -331,15 +365,12 @@ class SandboxService:
         return list(report.findings)
 
     def _prepare_workspace(self, execution_id: str, request: ExecutionRequest) -> Path:
-        """Create the job workspace and write program + input files.
+        """Create the job workspace and write the program entrypoint.
 
-        Runs synchronous filesystem setup in a worker thread-safe manner:
-        directory creation is quick metadata work; file contents go through the
-        async writer on the event loop by the caller? No — this helper is kept
-        synchronous for deterministic ordering and is called via
-        :func:`asyncio.to_thread` where relevant. Here we perform only mkdir +
-        entrypoint write (small strings), then schedule async file injection in
-        :meth:`_write_input_files`.
+        Directory creation and the small entrypoint write are synchronous
+        metadata operations on the injected workspace manager; bulk input-file
+        injection happens afterwards in :meth:`_write_input_files`, which is
+        async (aiofiles-backed).
 
         Args:
             execution_id: Unique job id naming the directory.
@@ -352,7 +383,7 @@ class SandboxService:
             WorkspaceError: Directory creation or entrypoint write failed.
         """
         path = self._workspace.create(execution_id)
-        entry = path / _entrypoint_filename(request.language)
+        entry = path / entrypoint_filename(request.language)
         try:
             entry.write_text(request.source, encoding="utf-8")
         except OSError as exc:
@@ -371,7 +402,7 @@ class SandboxService:
             WorkspaceError: Any file failed containment or I/O checks.
         """
         if request.files:
-            await self._workspace.write_files(workspace, request.files)  # type: ignore[attr-defined]
+            await self._workspace.write_files(workspace, request.files)
 
     async def _run_with_fallback(self, spec: ExecutionSpec, *, log: Any) -> ExecutionResult:
         """Execute on the primary kernel, falling back to local on hard failure.
@@ -391,7 +422,6 @@ class SandboxService:
             CircuitOpenError: Primary breaker open AND fallback unavailable.
             BackendUnavailableError: Both kernels failed to accept the job.
         """
-        await self._write_input_files(spec.cwd, _REQUEST_HOLDER.get(spec.execution_id, _empty_request()))
         try:
             return await self._backend.run(spec)
         except (BackendUnavailableError, CircuitOpenError) as exc:
@@ -423,43 +453,3 @@ class SandboxService:
             self._workspace.cleanup(path)
         except WorkspaceError as exc:
             log.error("workspace_cleanup_failed", path=str(path), error=str(exc))
-
-
-# Small compatibility shim: the service writes the entrypoint synchronously but
-# needs the original request later for async file injection. Rather than widen
-# ExecutionSpec, we key requests by execution id for the lifetime of one call.
-_REQUEST_HOLDER: dict[str, ExecutionRequest] = {}
-
-
-def _empty_request() -> ExecutionRequest:
-    """Return a minimal placeholder request (no files).
-
-    Returns:
-        An :class:`ExecutionRequest` with trivial content used only when no
-        real request is registered for an execution id.
-    """
-    return ExecutionRequest(language=Language.PYTHON, source="pass")
-
-
-async def execute_request(service: SandboxService, request: ExecutionRequest) -> ExecutionResult:
-    """Module-level helper pairing request registration with execution.
-
-    Keeps :class:`ExecutionSpec` free of transport-only fields by registering
-    the full request for the duration of one call.
-
-    Args:
-        service: Initialized facade.
-        request: Client submission.
-
-    Returns:
-        Typed execution result.
-
-    Raises:
-        SandboxError: Whatever :meth:`SandboxService.execute` raises.
-    """
-    execution_id = new_execution_id()
-    _REQUEST_HOLDER[execution_id] = request
-    try:
-        return await service.execute(request)
-    finally:
-        _REQUEST_HOLDER.pop(execution_id, None)

@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     # --- http api server ---------------------------------------------------
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8090, ge=1, le=65535)
+    api_auth_token: str = ""  # empty disables auth; set via SANDBOX_API_AUTH_TOKEN
 
     # --- resilience (remote adapters: docker/http) --------------------------
     retry_max_attempts: int = Field(default=3, ge=1, le=10)
@@ -147,6 +148,8 @@ class Settings(BaseSettings):
             raise ValueError("SANDBOX_RETRY_BASE_DELAY_S must be <= SANDBOX_RETRY_MAX_DELAY_S")
         if self.default_backend == "http" and not self.remote_base_url:
             raise ValueError("SANDBOX_REMOTE_BASE_URL is required when backend is 'http'")
+        if self.max_timeout_s < self.default_timeout_s:
+            raise ValueError("SANDBOX_MAX_TIMEOUT_S must be >= SANDBOX_DEFAULT_TIMEOUT_S")
         return self
 
     @property

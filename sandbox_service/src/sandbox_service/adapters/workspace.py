@@ -27,8 +27,27 @@ import aiofiles
 
 from sandbox_service.config import Settings
 from sandbox_service.exceptions import WorkspaceError
-from sandbox_service.models import InputFile
+from sandbox_service.models import InputFile, Language
 from sandbox_service.observability import get_logger
+
+
+def entrypoint_filename(language: Language) -> str:
+    """Return the canonical workspace filename holding a submission's source.
+
+    Args:
+        language: Submission language.
+
+    Returns:
+        ``"__main__.py"`` for Python, ``"main.sh"`` for Bash. The name is
+        written by the service layer into every job workspace and referenced
+        by backends through :attr:`~sandbox_service.interfaces.ExecutionSpec.entrypoint_name`,
+        so adapters never need to agree on a private convention.
+
+    Example:
+        >>> entrypoint_filename(Language.PYTHON)
+        '__main__.py'
+    """
+    return "__main__.py" if language is Language.PYTHON else "main.sh"
 
 
 class LocalWorkspaceManager:

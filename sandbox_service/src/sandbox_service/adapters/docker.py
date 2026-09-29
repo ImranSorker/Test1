@@ -23,7 +23,6 @@ import shlex
 import shutil
 from collections.abc import Sequence
 
-from sandbox_service.adapters.local import _entrypoint_filename
 from sandbox_service.config import Settings
 from sandbox_service.exceptions import BackendUnavailableError
 from sandbox_service.interfaces import Clock, ExecutionSpec, RandomSource, Sleeper
@@ -148,7 +147,7 @@ class DockerBackend:
         """
         cli = self._require_cli()
         container_name = f"{self._settings.docker_container_prefix}-{spec.execution_id.replace('_', '-')}"
-        entry = f"/work/{_entrypoint_filename(spec.language)}"
+        entry = f"/work/{spec.entrypoint_name}"
         from sandbox_service.models import Language
 
         inner: Sequence[str]

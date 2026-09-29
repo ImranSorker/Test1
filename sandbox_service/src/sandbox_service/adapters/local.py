@@ -55,15 +55,17 @@ except (ImportError, ValueError, OSError):
 
 
 def _entrypoint_filename(language: Language) -> str:
-    """Return the workspace filename used for a language's program text.
+    """Deprecated alias kept for backward compatibility.
 
     Args:
         language: Submission language.
 
     Returns:
-        A safe relative filename such as ``"__main__.py"`` or ``"main.sh"``.
+        The canonical workspace entrypoint filename.
     """
-    return "__main__.py" if language is Language.PYTHON else "main.sh"
+    from sandbox_service.adapters.workspace import entrypoint_filename
+
+    return entrypoint_filename(language)
 
 
 class _CappedStreamReader:
@@ -164,18 +166,29 @@ class LocalProcessBackend:
             settings: Resolved interpreter paths and limit ceilings.
             clock: Injectable clock for duration measurement.
 
-        Raises:
-            BackendUnavailableError: If configured interpreters cannot be found.
+        Note:
+            Interpreter resolution is deferred to first use so constructing a
+            service (for tests, config validation, or health probing) never
+            raises merely because bash is missing; :meth:`health_check` and
+            :meth:`run` report the problem instead.
         """
         self.name: str = "local"
         self._settings = settings
         self._clock: Clock = clock or SystemClock()
         self._log = get_logger(__name__, component="backend", backend=self.name)
+        self._python_error: str | None = None
+        self._bash_error: str | None = None
         try:
-            self._python = settings.resolved_python_binary()
-            self._bash = settings.resolved_bash_binary() if "bash" in settings.allowed_languages else ""
+            self._python: str = settings.resolved_python_binary()
         except ValueError as exc:
-            raise BackendUnavailableError(f"local interpreter missing: {exc}") from exc
+            self._python = ""
+            self._python_error = str(exc)
+        self._bash: str = ""
+        if "bash" in settings.allowed_languages:
+            try:
+                self._bash = settings.resolved_bash_binary()
+            except ValueError as exc:
+                self._bash_error = str(exc)
 
     async def health_check(self) -> bool:
         """Verify interpreters exist and are executable.
@@ -183,8 +196,12 @@ class LocalProcessBackend:
         Returns:
             True when every allowed interpreter resolves on disk.
         """
+        if self._python_error is not None or not self._python:
+            return False
         python_ok = Path(self._python).exists()
-        bash_ok = (not self._bash) or Path(self._bash).exists()
+        bash_ok = (not self._settings.allowed_languages or "bash" not in self._settings.allowed_languages) or (
+            self._bash_error is None and bool(self._bash) and Path(self._bash).exists()
+        )
         return python_ok and bash_ok
 
     async def close(self) -> None:
@@ -201,14 +218,16 @@ class LocalProcessBackend:
             Absolute interpreter path.
 
         Raises:
-            BackendUnavailableError: If the interpreter was not resolved at
-                construction time (e.g. bash disabled but requested later).
+            BackendUnavailableError: If the interpreter could not be resolved
+                (missing binary) or has no mapping for the language.
         """
         if language is Language.PYTHON:
+            if not self._python:
+                raise BackendUnavailableError(f"python interpreter unavailable: {self._python_error}")
             return self._python
         if language is Language.BASH:
             if not self._bash:
-                raise BackendUnavailableError("bash interpreter unavailable")
+                raise BackendUnavailableError(f"bash interpreter unavailable: {self._bash_error}")
             return self._bash
         raise BackendUnavailableError(f"no interpreter for language {language!r}")
 
@@ -225,7 +244,7 @@ class LocalProcessBackend:
             BackendUnavailableError: If the language has no interpreter.
         """
         interpreter = self._interpreter_for(spec.language)
-        entry = spec.cwd / _entrypoint_filename(spec.language)
+        entry = spec.cwd / spec.entrypoint_name
         program_argv = [interpreter, str(entry), *spec.args]
 
         env = {"PATH": os.defpath + ":/usr/bin:/bin", "HOME": str(spec.cwd), "LANG": "C.UTF-8"}
